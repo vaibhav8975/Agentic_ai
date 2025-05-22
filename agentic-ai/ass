@@ -1,0 +1,161 @@
+import re
+import os
+import json
+import requests
+from ms_graph_helper import get_users, schedule_event
+from bedrock_agent import invoke_bedrock
+from datetime import datetime, timedelta
+
+def read_access_token():
+    try:
+        with open("token.json", "r") as f:
+            data = json.load(f)
+            return data.get("access_token")
+    except FileNotFoundError:
+        print("❌ Access token file not found. Please run ms_login first.")
+        return None
+    except Exception as e:
+        print(f"❌ Failed to read access token: {e}")
+        return None
+
+def schedule_meeting(command, token):
+    name_match = re.search(r"with (\w+)", command)
+    time_match = re.search(r"at (\d+ ?(am|pm))", command)
+
+    if not name_match or not time_match:
+        print("🤖 Buddy: I couldn't parse the meeting details.")
+        return True
+
+    name = name_match.group(1).capitalize()
+    time_str = time_match.group(1).lower().replace(" ", "")
+    hour = int(time_str[:-2])
+    am_pm = time_str[-2:]
+    if am_pm == "pm" and hour != 12:
+        hour += 12
+    elif am_pm == "am" and hour == 12:
+        hour = 0
+
+    now = datetime.utcnow()
+    meeting_time = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+    if "tomorrow" in command:
+        meeting_time += timedelta(days=1)
+    end_time = meeting_time + timedelta(hours=1)
+
+    print(f"🤖 Searching for users named '{name}'...")
+    matches = get_users(token, name)
+
+    if not matches:
+        print("❌ No matching users found in your tenant.")
+        return True
+
+    if len(matches) == 1:
+        selected_user = matches[0]
+    else:
+        print("🔎 Multiple matches found:")
+        for i, user in enumerate(matches, 1):
+            print(f"{i}. {user['displayName']} ({user['mail'] or user['userPrincipalName']})")
+        choice = int(input("👉 Who do you want to invite? Enter number: "))
+        selected_user = matches[choice - 1]
+
+    attendee_email = selected_user["mail"] or selected_user["userPrincipalName"]
+    attendee_name = selected_user["displayName"]
+    subject = input("📜 Enter meeting subject: ")
+
+    success, result = schedule_event(token, subject, meeting_time.isoformat(), end_time.isoformat(), attendee_email, attendee_name)
+    if success:
+        print(f"✅ Meeting scheduled with {attendee_name} at {meeting_time.strftime('%H:%M')} UTC.")
+    else:
+        print("❌ Failed to schedule meeting:", result)
+
+    return True
+
+def get_todays_meetings(token):
+    utc_now = datetime.utcnow()
+    start_of_day = utc_now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
+    end_of_day = utc_now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat() + "Z"
+
+    url = f"https://graph.microsoft.com/v1.0/me/calendarView?startDateTime={start_of_day}&endDateTime={end_of_day}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Prefer": 'outlook.timezone="UTC"',
+    }
+
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        events = response.json().get("value", [])
+        if not events:
+            print("📅 You have no meetings scheduled for today.")
+        else:
+            print(f"📅 You have {len(events)} meeting(s) today:")
+            for event in events:
+                start = event['start']['dateTime']
+                subject = event.get("subject", "No Subject")
+                attendees = [a['emailAddress']['name'] for a in event.get("attendees", [])]
+                print(f"🔸 {subject} at {start} with {', '.join(attendees)}")
+    else:
+        print("❌ Failed to fetch calendar events:", response.text)
+
+def get_tomorrows_meetings(token):
+    utc_now = datetime.utcnow()
+    tomorrow = utc_now + timedelta(days=1)
+    start = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
+    end = tomorrow.replace(hour=23, minute=59, second=59, microsecond=0).isoformat() + "Z"
+
+    url = f"https://graph.microsoft.com/v1.0/me/calendarView?startDateTime={start}&endDateTime={end}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Prefer": 'outlook.timezone="UTC"',
+    }
+
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        events = response.json().get("value", [])
+        if not events:
+            print("📅 You have no meetings scheduled for tomorrow.")
+        else:
+            print(f"📅 You have {len(events)} meeting(s) tomorrow:")
+            for event in events:
+                start = event['start']['dateTime']
+                subject = event.get("subject", "No Subject")
+                attendees = [a['emailAddress']['name'] for a in event.get("attendees", [])]
+                print(f"🔸 {subject} at {start} with {', '.join(attendees)}")
+    else:
+        print("❌ Failed to fetch tomorrow's events:", response.text)
+
+def handle_command(command, token):
+    command = command.lower()
+
+    if "schedule" in command and "meeting" in command:
+        return schedule_meeting(command, token)
+    elif "today" in command and "meeting" in command:
+        get_todays_meetings(token)
+        return True
+    elif "tomorrow" in command and "meeting" in command:
+        get_tomorrows_meetings(token)
+        return True
+    elif "delete" in command and "meeting" in command:
+        print("🗑️ Feature to delete a meeting is coming soon.")
+        return True
+    elif "update" in command and "meeting" in command:
+        print("🔁 Feature to update a meeting is coming soon.")
+        return True
+
+    reply = invoke_bedrock(command)
+    print(f"🤖 Buddy: {reply}")
+    return True
+
+def main():
+    token = read_access_token()
+    if not token:
+        return
+
+    print("👋 Hi! I'm your assistant. Type a command or 'exit' to quit.")
+    while True:
+        command = input("You: ")
+        if command.lower() == "exit":
+            break
+        handle_command(command, token)
+
+if __name__ == "__main__":
+    main()
+

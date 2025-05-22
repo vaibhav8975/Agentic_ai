@@ -1,0 +1,295 @@
+import re
+import json
+import requests
+import pytz
+from dateutil import parser
+from ms_graph_helper import get_users
+from bedrock_agent import invoke_bedrock
+from datetime import datetime, timedelta
+
+IST = pytz.timezone("Asia/Kolkata")
+
+def read_access_token():
+    try:
+        with open("token.txt", "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        print("❌ Access token file not found. Please run ms_login first.")
+        return None
+
+def convert_utc_to_ist(utc_time_str):
+    utc_dt = datetime.fromisoformat(utc_time_str.replace("Z", "+00:00"))
+    ist_dt = utc_dt.astimezone(IST)
+    return ist_dt.strftime("%Y-%m-%d %I:%M %p")
+
+def parse_time_string(time_str):
+    try:
+        return parser.parse(time_str).time()
+    except Exception:
+        return None
+
+def extract_attendees_and_time(command):
+    name_match = re.search(r"with (.+?) at", command)
+    time_match = re.search(r"at ([\d: ]+(?:am|pm))", command, re.IGNORECASE)
+
+    if not name_match or not time_match:
+        return None, None
+
+    names_str = name_match.group(1)
+    names = [n.strip().capitalize() for n in re.split(r"and|,", names_str)]
+    time_input = time_match.group(1).replace(" ", "").lower()
+    time_obj = parse_time_string(time_input)
+
+    return names, time_obj
+
+def schedule_meeting(command, token):
+    names, time_obj = extract_attendees_and_time(command)
+
+    if not names or not time_obj:
+        print("🤖 Buddy: I couldn't understand who to invite or the time.")
+        return True
+
+    now = datetime.now(IST)
+    meeting_time = now.replace(hour=time_obj.hour, minute=time_obj.minute, second=0, microsecond=0)
+    if "tomorrow" in command:
+        meeting_time += timedelta(days=1)
+    end_time = meeting_time + timedelta(hours=1)
+
+    attendees = []
+    for name in names:
+        print(f"🔍 Searching for users named '{name}'...")
+        matches = get_users(token, name)
+
+        if not matches:
+            print(f"❌ No matching users found for '{name}'.")
+            continue
+
+        if len(matches) == 1:
+            selected_user = matches[0]
+        else:
+            print("🔎 Multiple matches found:")
+            for i, user in enumerate(matches, 1):
+                print(f"{i}. {user['displayName']} ({user['mail'] or user['userPrincipalName']})")
+            try:
+                choice = int(input("👉 Choose the user number to invite: "))
+                selected_user = matches[choice - 1]
+            except Exception:
+                print("❌ Invalid choice.")
+                continue
+
+        email = selected_user["mail"] or selected_user["userPrincipalName"]
+        attendees.append({
+            "email": email,
+            "name": selected_user["displayName"]
+        })
+
+    if not attendees:
+        print("❌ No valid attendees found.")
+        return True
+
+    subject = input("📜 Enter meeting subject: ") or "Meeting Scheduled via Assistant"
+
+    body = {
+        "subject": subject,
+        "start": {
+            "dateTime": meeting_time.astimezone(pytz.utc).isoformat(),
+            "timeZone": "UTC"
+        },
+        "end": {
+            "dateTime": end_time.astimezone(pytz.utc).isoformat(),
+            "timeZone": "UTC"
+        },
+        "attendees": [
+            {
+                "emailAddress": {
+                    "address": a["email"],
+                    "name": a["name"]
+                },
+                "type": "required"
+            } for a in attendees
+        ],
+        "isOnlineMeeting": True,
+        "onlineMeetingProvider": "teamsForBusiness"
+    }
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    res = requests.post("https://graph.microsoft.com/v1.0/me/events", headers=headers, data=json.dumps(body))
+    if res.status_code == 201:
+        print(f"✅ Meeting scheduled *by you* with {', '.join(a['name'] for a in attendees)} at {meeting_time.strftime('%I:%M %p')} IST.")
+    elif res.status_code == 401:
+        print("🔐 Token may be expired. Please re-authenticate.")
+    else:
+        print("❌ Failed to schedule meeting:", res.text)
+
+    return True
+
+def get_events(token, day_offset=0):
+    now = datetime.now(IST) + timedelta(days=day_offset)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(pytz.utc).isoformat()
+    end = now.replace(hour=23, minute=59, second=59, microsecond=0).astimezone(pytz.utc).isoformat()
+
+    url = f"https://graph.microsoft.com/v1.0/me/calendarView?startDateTime={start}&endDateTime={end}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Prefer": 'outlook.timezone="UTC"'
+    }
+
+    response = requests.get(url, headers=headers)
+    return response.json().get("value", []) if response.status_code == 200 else []
+
+def list_meetings(events, label):
+    if not events:
+        print(f"📅 You have no meetings scheduled for {label}.")
+    else:
+        print(f"📅 You have {len(events)} meeting(s) {label}:")
+        for event in events:
+            start = convert_utc_to_ist(event['start']['dateTime'])
+            subject = event.get("subject", "No Subject")
+            attendees = [a['emailAddress']['name'] for a in event.get("attendees", [])]
+            print(f"🔸 {subject} at {start} with {', '.join(attendees)}")
+
+def find_meeting_by_term(events, match_term):
+    match_term = match_term.lower()
+    for event in events:
+        subject = event.get("subject", "").lower()
+        attendees = [a.get("emailAddress", {}).get("name", "").lower() for a in event.get("attendees", [])]
+        if match_term in subject or any(match_term in a for a in attendees):
+            return event
+    return None
+
+def delete_meeting(token, match_term):
+    events = get_events(token, 0)
+    event = find_meeting_by_term(events, match_term)
+    if not event:
+        return False, "No matching meeting found."
+
+    delete_url = f"https://graph.microsoft.com/v1.0/me/events/{event['id']}"
+    headers = { "Authorization": f"Bearer {token}" }
+    response = requests.delete(delete_url, headers=headers)
+    if response.status_code == 204:
+        return True, f"Deleted meeting: {event.get('subject', 'No Subject')}"
+    else:
+        return False, f"Failed to delete: {response.text}"
+
+def update_meeting(token):
+    events = get_events(token, 0)
+    term = input("✏️ Enter subject or name to update: ").lower()
+    event = find_meeting_by_term(events, term)
+    if not event:
+        print("❌ No matching meeting found.")
+        return
+
+    time_input = input("🕒 Enter new time (e.g., 3:30pm): ").strip().lower()
+    time_obj = parse_time_string(time_input)
+    if not time_obj:
+        print("❌ Invalid time format.")
+        return
+
+    now = datetime.now(IST)
+    new_start = now.replace(hour=time_obj.hour, minute=time_obj.minute, second=0, microsecond=0).astimezone(pytz.utc)
+    new_end = new_start + timedelta(hours=1)
+    new_subject = input("📝 Enter new subject (leave blank to keep current): ") or event.get("subject")
+
+    patch_data = {
+        "start": {"dateTime": new_start.isoformat(), "timeZone": "UTC"},
+        "end": {"dateTime": new_end.isoformat(), "timeZone": "UTC"},
+        "subject": new_subject,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    url = f"https://graph.microsoft.com/v1.0/me/events/{event['id']}"
+    res = requests.patch(url, headers=headers, data=json.dumps(patch_data))
+    if res.status_code == 200:
+        print("✅ Meeting updated.")
+    else:
+        print("❌ Failed to update meeting:", res.text)
+
+def get_meeting_details(token, match_term):
+    events = get_events(token, 0)
+    event = find_meeting_by_term(events, match_term)
+    if not event:
+        print("❌ No matching meeting found.")
+        return
+
+    subject = event.get("subject", "No Subject")
+    start = convert_utc_to_ist(event['start']['dateTime'])
+    end = convert_utc_to_ist(event['end']['dateTime'])
+    attendees = [a['emailAddress']['name'] for a in event.get("attendees", [])]
+
+    print(f"📋 Details for meeting '{subject}':")
+    print(f"    Start: {start} IST")
+    print(f"    End: {end} IST")
+    print(f"    Attendees: {', '.join(attendees)}")
+    print(f"    Online Meeting URL: {event.get('onlineMeeting', {}).get('joinUrl', 'N/A')}")
+
+def handle_command(command, token):
+    command_lower = command.lower()
+
+    if "schedule" in command_lower and "meeting" in command_lower:
+        return schedule_meeting(command, token)
+
+    elif "today" in command_lower and "meeting" in command_lower:
+        events = get_events(token, 0)
+        list_meetings(events, "today")
+        return True
+
+    elif "tomorrow" in command_lower and "meeting" in command_lower:
+        events = get_events(token, 1)
+        list_meetings(events, "tomorrow")
+        return True
+
+    elif "delete" in command_lower and "meeting" in command_lower:
+        term = input("🗑️ Enter subject or name to delete: ").strip()
+        success, msg = delete_meeting(token, term)
+        print(f"{'✅' if success else '❌'} {msg}")
+        return True
+
+    elif "update" in command_lower and "meeting" in command_lower:
+        update_meeting(token)
+        return True
+
+    elif "details" in command_lower and "meeting" in command_lower:
+        term = input("🔍 Enter subject or name to get details: ").strip()
+        get_meeting_details(token, term)
+        return True
+
+    return False
+
+def run_agent(user_command):
+    if not user_command.strip():
+        print("🤖 Buddy: Please enter a command.")
+        return
+
+    token = read_access_token()
+    if not token:
+        return
+
+    # Check for MS Graph commands first
+    if handle_command(user_command, token):
+        return
+
+    # Default fallback to Bedrock agent
+    print("🤖 Buddy: Processing your request...")
+    response = invoke_bedrock(user_command)
+    print(f"🤖 Buddy: {response}")
+
+if __name__ == "__main__":
+    print("🟢 Microsoft Graph Assistant started. Type your commands.")
+    while True:
+        try:
+            cmd = input("You: ")
+            if cmd.lower() in ("exit", "quit"):
+                print("👋 Goodbye!")
+                break
+            run_agent(cmd)
+        except KeyboardInterrupt:
+            print("\n👋 Interrupted. Bye!")
+            break
+
